@@ -22,6 +22,7 @@ class NexTransfer extends EventTarget {
         this.peer = null; this.conn = null; this.role = null;
         this.files = []; this.receivedMeta = null;
         this.recvBuffers = []; this.recvReceived = [];
+        this._recvFileLimit = []; this._recvMaxChunks = [];
         this.recvTotalSize = 0; this.recvStartAt = 0;
         this.pendingDownloadUrls = [];
         this._expiryTimer = null; this._expiryStart = null;
@@ -96,11 +97,40 @@ class NexTransfer extends EventTarget {
         return m + ':' + String(s).padStart(2, '0');
     }
 
+    static isBlocked(name, type) {
+        const ext = '.' + (String(name == null ? '' : name).split('.').pop() || '').toLowerCase();
+        return BLOCKED_EXTS.has(ext) || BLOCKED_TYPES.has(type);
+    }
+
+    // Coerce a remote-supplied size to a safe non-negative integer.
+    static _safeSize(n) {
+        return (typeof n === 'number' && isFinite(n) && n >= 0) ? Math.floor(n) : 0;
+    }
+
+    // Strip path components, control chars and Unicode bidi overrides (used for
+    // extension spoofing, e.g. U+202E RIGHT-TO-LEFT OVERRIDE) from a peer-supplied
+    // filename before it is displayed or used as a download name. Ordinary
+    // filenames — including legitimate RTL scripts — pass through unchanged.
+    static sanitizeFilename(name) {
+        const raw = String(name == null ? '' : name).replace(/^.*[\\/]/, '');
+        let out = '';
+        for (let i = 0; i < raw.length; i++) {
+            const c = raw.charCodeAt(i);
+            if (c < 0x20 || c === 0x7F) continue;                 // C0 controls + DEL
+            if (c >= 0x202A && c <= 0x202E) continue;             // bidi embeddings/overrides
+            if (c >= 0x2066 && c <= 0x2069) continue;             // bidi isolates
+            if (c === 0x200E || c === 0x200F) continue;           // LRM / RLM
+            out += raw[i];
+        }
+        out = out.trim().slice(0, 255);
+        if (!out || /^\.+$/.test(out)) out = 'fichier';
+        return out;
+    }
+
     static validateFiles(files) {
         const errors = [];
         for (const f of files) {
-            const ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
-            if (BLOCKED_EXTS.has(ext) || BLOCKED_TYPES.has(f.type))
+            if (NexTransfer.isBlocked(f.name, f.type))
                 errors.push('"' + f.name + '" est bloqué pour des raisons de sécurité.');
         }
         return errors;
@@ -192,7 +222,9 @@ class NexTransfer extends EventTarget {
         return new Promise(resolve => {
             const check = () => {
                 const dc = this.conn && this.conn.dataChannel;
-                if (!dc || dc.bufferedAmount < this.maxBuffer) return resolve();
+                // Resolve if the channel is gone or no longer open, otherwise we would
+                // busy-wait forever on a stalled/closed channel.
+                if (!dc || dc.readyState !== 'open' || dc.bufferedAmount < this.maxBuffer) return resolve();
                 setTimeout(check, 50);
             };
             check();
@@ -222,46 +254,73 @@ class NexTransfer extends EventTarget {
     _handleData(msg) {
         if (!msg || typeof msg !== 'object') return;
         if (msg.type === 'meta') {
-            this.receivedMeta = msg.files;
-            this.recvBuffers  = msg.files.map(() => []);
-            this.recvReceived = msg.files.map(() => 0);
-            this.recvTotalSize = msg.totalSize || msg.files.reduce((a, f) => a + (f.size || 0), 0);
+            // Untrusted peer input: require a sane file array and coerce every field.
+            if (!Array.isArray(msg.files) || msg.files.length === 0 || msg.files.length > 4096) {
+                this._emit('error', { message: 'Métadonnées de transfert invalides.' });
+                return;
+            }
+            const files = msg.files.map(f => ({
+                name: NexTransfer.sanitizeFilename(f && f.name),
+                size: NexTransfer._safeSize(f && f.size),
+                fileType: (f && typeof f.fileType === 'string') ? f.fileType.slice(0, 255) : '',
+            }));
+            this.receivedMeta   = files;
+            this.recvBuffers    = files.map(() => []);
+            this.recvReceived   = files.map(() => 0);
+            this._recvFileLimit = files.map(f => f.size);
+            // Bound the per-file chunk index so a hostile chunkIndex cannot create a
+            // giant sparse array (generous: allows chunks down to ~1 KiB + slack).
+            this._recvMaxChunks = files.map(f => Math.ceil(f.size / 1024) + 16);
+            this.recvTotalSize = NexTransfer._safeSize(msg.totalSize) || files.reduce((a, f) => a + f.size, 0);
             this.recvStartAt = 0;
-            this._emit('incoming', { files: msg.files, totalSize: msg.totalSize });
+            this._emit('incoming', { files: files, totalSize: this.recvTotalSize });
         } else if (msg.type === 'file-start') {
             this._emit('file-start', { index: msg.index, name: msg.name, size: msg.size });
         } else if (msg.type === 'chunk') {
-            const { index, chunkIndex, data } = msg;
+            const { index, chunkIndex } = msg;
+            // Validate peer-supplied indices and payload before indexing/allocating.
+            if (!this.receivedMeta || !Number.isInteger(index) || index < 0 || index >= this.recvBuffers.length) return;
+            if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= this._recvMaxChunks[index]) return;
+            let data = msg.data;
+            if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+            if (!(data instanceof Uint8Array)) return;
+            const prev = this.recvBuffers[index][chunkIndex];
+            const delta = data.byteLength - (prev ? prev.byteLength : 0);
+            // Never accept more bytes for a file than the sender declared (and the
+            // user accepted) — blocks "declare 1 KB, stream gigabytes" memory DoS.
+            if (this.recvReceived[index] + delta > this._recvFileLimit[index]) return;
             if (!this.recvStartAt) this.recvStartAt = Date.now();
             this.recvBuffers[index][chunkIndex] = data;
-            this.recvReceived[index] += data.byteLength;
+            this.recvReceived[index] += delta;
             const totalReceived = this.recvReceived.reduce((a, b) => a + b, 0);
             const totalSize     = this.recvTotalSize || this.receivedMeta.reduce((a, f) => a + f.size, 0);
             const elapsed       = Math.max(0.001, (Date.now() - this.recvStartAt) / 1000);
             const speed         = totalReceived / elapsed;
             this._emit('progress', {
                 sent: totalReceived, total: totalSize,
-                percent: Math.round(totalReceived / totalSize * 100),
+                percent: totalSize ? Math.round(totalReceived / totalSize * 100) : 0,
                 speed,
                 remaining: Math.max(0, totalSize - totalReceived) / Math.max(speed, 1),
                 fileIndex: index, fileName: this.receivedMeta[index] && this.receivedMeta[index].name,
             });
         } else if (msg.type === 'file-end') {
+            const index = msg.index;
+            if (!this.receivedMeta || !Number.isInteger(index) || index < 0 || index >= this.receivedMeta.length) return;
             try {
-                const meta = this.receivedMeta[msg.index];
-                const blob = new Blob(this.recvBuffers[msg.index], { type: meta.fileType || 'application/octet-stream' });
+                const meta = this.receivedMeta[index];
+                const blob = new Blob(this.recvBuffers[index], { type: meta.fileType || 'application/octet-stream' });
                 const autoDownload = this._shouldAutoDownload(meta);
                 const dl = this._download(blob, meta.name, autoDownload);
                 // Release per-file chunks immediately to avoid mobile memory spikes.
-                this.recvBuffers[msg.index] = [];
+                this.recvBuffers[index] = [];
                 this._emit('file-ready', {
-                    index: msg.index,
+                    index: index,
                     name: meta.name,
                     size: meta.size,
                     url: dl.url,
                     autoDownloaded: dl.autoTriggered,
                 });
-                this._emit('file-done', { index: msg.index, name: meta.name });
+                this._emit('file-done', { index: index, name: meta.name });
             } catch (err) {
                 this._emit('error', { message: 'Échec de finalisation du fichier reçu (mémoire insuffisante).' });
             }
@@ -275,6 +334,10 @@ class NexTransfer extends EventTarget {
     reject()  { if (this.conn) this.conn.send({ type: 'reject' }); this.destroy(); }
 
     _shouldAutoDownload(meta) {
+        // Defense in depth: the block-list is enforced sender-side, but a malicious
+        // peer can run a modified client. Never SILENTLY auto-download a blocked /
+        // executable type — route it through the manual (explicit click) path instead.
+        if (NexTransfer.isBlocked(meta && meta.name, meta && meta.fileType)) return false;
         const ua = navigator.userAgent || '';
         const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
         const isVideo = !!(meta && meta.fileType && /^video\//i.test(meta.fileType));
