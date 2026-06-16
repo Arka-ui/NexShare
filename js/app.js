@@ -22,7 +22,13 @@ function toast(msg, type, duration) {
     var tc = document.getElementById('toast-container');
     var el = document.createElement('div');
     el.className = 'toast ' + type;
-    el.innerHTML = '<i class="bi ' + (icons[type] || icons.info) + '"></i><span>' + msg + '</span>';
+    // Build via DOM + textContent so the message can never be parsed as HTML.
+    var ic = document.createElement('i');
+    ic.className = 'bi ' + (icons[type] || icons.info);
+    var span = document.createElement('span');
+    span.textContent = msg;
+    el.appendChild(ic);
+    el.appendChild(span);
     tc.appendChild(el);
     setTimeout(function() {
         el.style.transition = 'all .3s ease';
@@ -36,7 +42,12 @@ var diagKey = 'nexshare-diag-v1';
 var diagnostics = { startedAt: new Date().toISOString(), events: [] };
 try {
     var previous = localStorage.getItem(diagKey);
-    if (previous) diagnostics = JSON.parse(previous);
+    if (previous) {
+        var parsed = JSON.parse(previous);
+        // Only adopt a well-formed value; otherwise keep the default so later
+        // diagnostics.events.push() can never throw on a corrupted/foreign value.
+        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.events)) diagnostics = parsed;
+    }
 } catch (_) {}
 
 function pushDiag(level, message, data) {
@@ -306,7 +317,7 @@ if (networkQualityInfo) {
 
 /* ── File icon ── */
 function fileIcon(name) {
-    var ext = (name.split('.').pop() || '').toLowerCase();
+    var ext = (String(name == null ? '' : name).split('.').pop() || '').toLowerCase();
     if (['jpg','jpeg','png','gif','webp','svg','avif'].indexOf(ext) > -1) return 'bi-file-image';
     if (['mp4','mov','avi','mkv','webm'].indexOf(ext) > -1)               return 'bi-file-play';
     if (['mp3','ogg','flac','wav','aac'].indexOf(ext) > -1)               return 'bi-file-music';
@@ -321,7 +332,8 @@ function fileIcon(name) {
 function esc(s) {
     return String(s)
         .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
 }
 
 function copyToClipboard(text) {
