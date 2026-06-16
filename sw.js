@@ -1,4 +1,6 @@
-const CACHE_NAME = 'nexshare-cache-v1';
+// Bump this version whenever a cached core asset changes, so installed PWAs
+// (cache-first) drop the old cache on activate and fetch the updated files.
+const CACHE_NAME = 'nexshare-cache-v2';
 const CORE_ASSETS = [
   './',
   './index.html',
